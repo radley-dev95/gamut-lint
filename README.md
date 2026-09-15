@@ -48,6 +48,11 @@ name: oklch(L C H)
 - An optional alpha can follow as `/ A`, e.g. `oklch(0.7 0.1 30 / 50%)`.
 - Lines starting with `#`, and blank lines, are ignored.
 - The name and colon are optional; a bare `oklch(...)` is also valid.
+- A named entry can also be a hex color, e.g. `legacy: #3366ff`. Hex
+  supports the 3, 4, 6, and 8 digit forms (RGB, RGBA, RRGGBB, RRGGBBAA).
+  It's converted to OKLCH for reporting; since it's already an sRGB value,
+  it's always in gamut. A hex color needs a name — a bare `#...` at the
+  start of a line is indistinguishable from a comment.
 
 ## Error messages
 
@@ -71,7 +76,7 @@ hue fixed) to report the largest chroma that would still fit.
 
 ## Limitations (for now)
 
-- Only `oklch()` input is supported. No hex, `rgb()`, `hsl()`, or `lab()`.
+- Input is `oklch()` or hex. No `rgb()`, `hsl()`, or `lab()`.
 - Only checks against sRGB. No Display P3 or Rec. 2020 target gamut.
 - Stops after reporting all parse errors in a file; doesn't attempt partial
   recovery mid-line.

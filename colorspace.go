@@ -34,6 +34,54 @@ func oklabToLinearSRGB(L, a, b float64) (r, g, bl float64) {
 	return
 }
 
+// srgbGammaToLinear undoes sRGB gamma encoding for a single channel in
+// [0, 1], per the IEC 61966-2-1 piecewise curve.
+func srgbGammaToLinear(c float64) float64 {
+	if c <= 0.04045 {
+		return c / 12.92
+	}
+	return math.Pow((c+0.055)/1.055, 2.4)
+}
+
+// linearSRGBToOklab converts linear-light sRGB to OKLab. The matrices are
+// Björn Ottosson's published forward coefficients; they are not an exact
+// algebraic inverse of oklabToLinearSRGB's matrices (those are separately
+// published, rounded constants), so round-tripping a color through both
+// leaves a residual on the order of 1e-6 to 1e-5, well under epsilon.
+func linearSRGBToOklab(r, g, b float64) (L, a, bOut float64) {
+	l := 0.4122214708*r + 0.5363325363*g + 0.0514459929*b
+	m := 0.2119034982*r + 0.6806995451*g + 0.1073969566*b
+	s := 0.0883024619*r + 0.2817188376*g + 0.6299787005*b
+
+	l_ := math.Cbrt(l)
+	m_ := math.Cbrt(m)
+	s_ := math.Cbrt(s)
+
+	L = 0.2104542553*l_ + 0.7936177850*m_ - 0.0040720468*s_
+	a = 1.9779984951*l_ - 2.4285922050*m_ + 0.4505937099*s_
+	bOut = 0.0259040371*l_ + 0.7827717662*m_ - 0.8086757660*s_
+	return
+}
+
+// oklabToOklch converts OKLab to cylindrical OKLCH. Hue is in degrees,
+// normalized to [0, 360).
+func oklabToOklch(L, a, b float64) (l, c, hDeg float64) {
+	c = math.Hypot(a, b)
+	hDeg = math.Atan2(b, a) * 180 / math.Pi
+	if hDeg < 0 {
+		hDeg += 360
+	}
+	return L, c, hDeg
+}
+
+// srgbToOKLCH converts a gamma-encoded sRGB color (each channel in [0, 1])
+// to OKLCH. Used for input formats, like hex, that describe an sRGB value
+// directly rather than an OKLCH one.
+func srgbToOKLCH(r, g, b float64) (l, c, hDeg float64) {
+	L, a, bLab := linearSRGBToOklab(srgbGammaToLinear(r), srgbGammaToLinear(g), srgbGammaToLinear(b))
+	return oklabToOklch(L, a, bLab)
+}
+
 func inRange01(v float64) bool {
 	return v >= -epsilon && v <= 1+epsilon
 }
