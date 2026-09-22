@@ -82,6 +82,37 @@ func srgbToOKLCH(r, g, b float64) (l, c, hDeg float64) {
 	return oklabToOklch(L, a, bLab)
 }
 
+// hslToSRGB converts HSL (hue in degrees, saturation and lightness in
+// [0, 1]) to gamma-encoded sRGB, each channel in [0, 1]. This is the
+// standard CSS/HSL conversion, not an OKLab one; the result still needs to
+// go through srgbToOKLCH like any other sRGB input.
+func hslToSRGB(hDeg, sat, lig float64) (r, g, b float64) {
+	h := math.Mod(hDeg, 360)
+	if h < 0 {
+		h += 360
+	}
+	chroma := (1 - math.Abs(2*lig-1)) * sat
+	x := chroma * (1 - math.Abs(math.Mod(h/60, 2)-1))
+	m := lig - chroma/2
+
+	var r1, g1, b1 float64
+	switch {
+	case h < 60:
+		r1, g1, b1 = chroma, x, 0
+	case h < 120:
+		r1, g1, b1 = x, chroma, 0
+	case h < 180:
+		r1, g1, b1 = 0, chroma, x
+	case h < 240:
+		r1, g1, b1 = 0, x, chroma
+	case h < 300:
+		r1, g1, b1 = x, 0, chroma
+	default:
+		r1, g1, b1 = chroma, 0, x
+	}
+	return r1 + m, g1 + m, b1 + m
+}
+
 func inRange01(v float64) bool {
 	return v >= -epsilon && v <= 1+epsilon
 }

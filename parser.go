@@ -235,71 +235,95 @@ func (s *scanner) finishHexEntry(name string) (*Entry, error) {
 	}, nil
 }
 
-func (s *scanner) expect(c byte, what string) error {
-	if s.peek() != c {
-		return s.errf(s.here(), "expected %s, found %s", what, describeRest(s.text[s.pos:]))
+// scanHue parses a bare number optionally followed by "deg", as used by
+// both oklch()'s hue component and hsl()'s. Unlike scanComponent, the
+// result isn't normalized to [0, 360); the callers that need degrees
+// wrapped (hslToSRGB) do that themselves.
+func (s *scanner) scanHue() (float64, Pos, error) {
+	lit, pos, err := s.scanRawNumber()
+	if err != nil {
+		return 0, pos, err
 	}
-	s.advance()
-	return nil
+	h, err := strconv.ParseFloat(lit, 64)
+	if err != nil {
+		return 0, pos, s.errf(pos, "invalid number %q", lit)
+	}
+	if strings.HasPrefix(s.text[s.pos:], "deg") {
+		s.pos += len("deg")
+	}
+	return h, pos, nil
 }
 
-// ParseLine parses a single line of a palette file. It returns (nil, nil)
-// for blank lines and comment lines (lines whose first non-space
-// character is '#'). The palette line grammar is:
-//
-//	[name ':'] 'oklch(' lightness chroma hue ['/' alpha] ')'
-//	name ':' '#' hex-digits
-//
-// lightness and alpha accept a bare number or a percentage; chroma accepts
-// a bare number or a percentage of 0.4; hue accepts a bare number or a
-// number followed by "deg". A hex color requires a name, since a bare "#"
-// at the start of a line is indistinguishable from a comment; hex-digits
-// is 3, 4, 6, or 8 hex digits (RGB, RGBA, RRGGBB, or RRGGBBAA).
-func ParseLine(file string, lineNum int, raw string) (*Entry, error) {
-	s := &scanner{file: file, line: lineNum, text: raw}
-	s.skipSpaces()
-	if s.peek() == 0 || s.peek() == '#' {
-		return nil, nil
+// scanOptionalAlpha parses an optional "/ A" alpha suffix shared by
+// oklch(), rgb(), and hsl(). It returns (1.0, false, nil) when there is no
+// alpha suffix.
+func (s *scanner) scanOptionalAlpha() (float64, bool, error) {
+	if s.peek() != '/' {
+		return 1.0, false, nil
 	}
-
-	if !isIdentStart(s.peek()) {
-		return nil, s.errf(s.here(), "expected a color name or \"oklch(...)\", found %s", describeRest(s.text[s.pos:]))
-	}
-	ident, identPos := s.scanIdent()
-
-	var name string
-	var funcPos Pos
+	s.advance()
 	s.skipSpaces()
-	switch s.peek() {
-	case ':':
+	a, aPos, err := s.scanComponent(1.0)
+	if err != nil {
+		return 0, false, err
+	}
+	if a < 0 || a > 1+epsilon {
+		return 0, false, s.errf(aPos, "alpha %.4g is out of range (expected 0 to 1, or 0%% to 100%%)", a)
+	}
+	s.skipSpaces()
+	return a, true, nil
+}
+
+// scanRGBChannel parses one rgb() channel: a bare number in [0, 255] or a
+// percentage of 255. The returned value is scaled to [0, 1].
+func (s *scanner) scanRGBChannel(name string) (float64, Pos, error) {
+	lit, pos, err := s.scanRawNumber()
+	if err != nil {
+		return 0, pos, err
+	}
+	raw, err := strconv.ParseFloat(lit, 64)
+	if err != nil {
+		return 0, pos, s.errf(pos, "invalid number %q", lit)
+	}
+	var v float64
+	if s.peek() == '%' {
 		s.advance()
-		s.skipSpaces()
-		name = ident
-		if s.peek() == '#' {
-			return s.finishHexEntry(name)
-		}
-		if !isIdentStart(s.peek()) {
-			return nil, s.errf(s.here(), "expected a color function after %q, found %s", name+":", describeRest(s.text[s.pos:]))
-		}
-		fnIdent, pos := s.scanIdent()
-		if fnIdent != "oklch" {
-			return nil, s.errf(pos, "unsupported color function %q (only \"oklch\" is supported)", fnIdent)
-		}
-		funcPos = pos
-	case '(':
-		if ident != "oklch" {
-			return nil, s.errf(identPos, "unsupported color function %q (only \"oklch\" is supported)", ident)
-		}
-		funcPos = identPos
-	default:
-		return nil, s.errf(s.here(), "expected ':' or '(' after %q, found %s", ident, describeRest(s.text[s.pos:]))
+		v = raw / 100
+	} else {
+		v = raw / 255
 	}
-
-	if err := s.expect('(', "'('"); err != nil {
-		return nil, err
+	if v < -epsilon || v > 1+epsilon {
+		return 0, pos, s.errf(pos, "%s channel %.4g is out of range (expected 0 to 255, or 0%% to 100%%)", name, raw)
 	}
-	s.skipSpaces()
+	return v, pos, nil
+}
 
+// scanPercentComponent parses a number that must be followed by "%", as
+// hsl() requires for its saturation and lightness components. The returned
+// value is scaled to [0, 1].
+func (s *scanner) scanPercentComponent(name string) (float64, Pos, error) {
+	lit, pos, err := s.scanRawNumber()
+	if err != nil {
+		return 0, pos, err
+	}
+	raw, err := strconv.ParseFloat(lit, 64)
+	if err != nil {
+		return 0, pos, s.errf(pos, "invalid number %q", lit)
+	}
+	if s.peek() != '%' {
+		return 0, pos, s.errf(pos, "%s must be a percentage, found %s", name, describeRest(s.text[s.pos:]))
+	}
+	s.advance()
+	v := raw / 100
+	if v < -epsilon || v > 1+epsilon {
+		return 0, pos, s.errf(pos, "%s %.4g%% is out of range (expected 0%% to 100%%)", name, raw)
+	}
+	return v, pos, nil
+}
+
+// finishOKLCHEntry parses the inside of an "oklch(...)" literal, with the
+// opening paren already consumed.
+func (s *scanner) finishOKLCHEntry(name string, funcPos Pos, raw string) (*Entry, error) {
 	l, lPos, err := s.scanComponent(1.0)
 	if err != nil {
 		return nil, err
@@ -318,34 +342,15 @@ func ParseLine(file string, lineNum int, raw string) (*Entry, error) {
 	}
 	s.skipSpaces()
 
-	hLit, hPos, err := s.scanRawNumber()
+	h, _, err := s.scanHue()
 	if err != nil {
 		return nil, err
 	}
-	h, err := strconv.ParseFloat(hLit, 64)
-	if err != nil {
-		return nil, s.errf(hPos, "invalid number %q", hLit)
-	}
-	if strings.HasPrefix(s.text[s.pos:], "deg") {
-		s.pos += len("deg")
-	}
 	s.skipSpaces()
 
-	alpha := 1.0
-	hasAlpha := false
-	if s.peek() == '/' {
-		s.advance()
-		s.skipSpaces()
-		a, aPos, err := s.scanComponent(1.0)
-		if err != nil {
-			return nil, err
-		}
-		if a < 0 || a > 1+epsilon {
-			return nil, s.errf(aPos, "alpha %.4g is out of range (expected 0 to 1, or 0%% to 100%%)", a)
-		}
-		alpha = a
-		hasAlpha = true
-		s.skipSpaces()
+	alpha, hasAlpha, err := s.scanOptionalAlpha()
+	if err != nil {
+		return nil, err
 	}
 
 	if err := s.expect(')', "')'"); err != nil {
@@ -357,13 +362,177 @@ func ParseLine(file string, lineNum int, raw string) (*Entry, error) {
 	}
 
 	return &Entry{
-		Name:     name,
-		L:        l,
-		C:        c,
-		H:        h,
-		Alpha:    alpha,
-		HasAlpha: hasAlpha,
-		Pos:      funcPos,
-		Raw:      strings.TrimSpace(raw),
+		Name: name, L: l, C: c, H: h, Alpha: alpha, HasAlpha: hasAlpha,
+		Pos: funcPos, Raw: strings.TrimSpace(raw),
 	}, nil
+}
+
+// finishRGBEntry parses the inside of an "rgb(...)" literal, with the
+// opening paren already consumed, and converts it to OKLCH.
+func (s *scanner) finishRGBEntry(name string, funcPos Pos, raw string) (*Entry, error) {
+	r, _, err := s.scanRGBChannel("red")
+	if err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+
+	g, _, err := s.scanRGBChannel("green")
+	if err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+
+	b, _, err := s.scanRGBChannel("blue")
+	if err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+
+	alpha, hasAlpha, err := s.scanOptionalAlpha()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.expect(')', "')'"); err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+	if s.peek() != 0 && s.peek() != '#' {
+		return nil, s.errf(s.here(), "unexpected trailing text %s after color", describeRest(s.text[s.pos:]))
+	}
+
+	l, c, h := srgbToOKLCH(r, g, b)
+	return &Entry{
+		Name: name, L: l, C: c, H: h, Alpha: alpha, HasAlpha: hasAlpha,
+		Pos: funcPos, Raw: strings.TrimSpace(raw),
+	}, nil
+}
+
+// finishHSLEntry parses the inside of an "hsl(...)" literal, with the
+// opening paren already consumed, and converts it to OKLCH.
+func (s *scanner) finishHSLEntry(name string, funcPos Pos, raw string) (*Entry, error) {
+	hDeg, _, err := s.scanHue()
+	if err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+
+	sat, _, err := s.scanPercentComponent("saturation")
+	if err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+
+	lig, _, err := s.scanPercentComponent("lightness")
+	if err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+
+	alpha, hasAlpha, err := s.scanOptionalAlpha()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.expect(')', "')'"); err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+	if s.peek() != 0 && s.peek() != '#' {
+		return nil, s.errf(s.here(), "unexpected trailing text %s after color", describeRest(s.text[s.pos:]))
+	}
+
+	r, g, b := hslToSRGB(hDeg, sat, lig)
+	l, c, h := srgbToOKLCH(r, g, b)
+	return &Entry{
+		Name: name, L: l, C: c, H: h, Alpha: alpha, HasAlpha: hasAlpha,
+		Pos: funcPos, Raw: strings.TrimSpace(raw),
+	}, nil
+}
+
+func isSupportedFunc(name string) bool {
+	switch name {
+	case "oklch", "rgb", "hsl":
+		return true
+	}
+	return false
+}
+
+func (s *scanner) expect(c byte, what string) error {
+	if s.peek() != c {
+		return s.errf(s.here(), "expected %s, found %s", what, describeRest(s.text[s.pos:]))
+	}
+	s.advance()
+	return nil
+}
+
+// ParseLine parses a single line of a palette file. It returns (nil, nil)
+// for blank lines and comment lines (lines whose first non-space
+// character is '#'). The palette line grammar is:
+//
+//	[name ':'] 'oklch(' lightness chroma hue ['/' alpha] ')'
+//	[name ':'] 'rgb(' red green blue ['/' alpha] ')'
+//	[name ':'] 'hsl(' hue saturation lightness ['/' alpha] ')'
+//	name ':' '#' hex-digits
+//
+// lightness (oklch) and alpha accept a bare number or a percentage; chroma
+// accepts a bare number or a percentage of 0.4; hue accepts a bare number
+// or a number followed by "deg". rgb()'s channels accept a bare number
+// from 0 to 255 or a percentage; hsl()'s saturation and lightness require
+// a percentage. A hex color requires a name, since a bare "#" at the start
+// of a line is indistinguishable from a comment; hex-digits is 3, 4, 6, or
+// 8 hex digits (RGB, RGBA, RRGGBB, or RRGGBBAA).
+func ParseLine(file string, lineNum int, raw string) (*Entry, error) {
+	s := &scanner{file: file, line: lineNum, text: raw}
+	s.skipSpaces()
+	if s.peek() == 0 || s.peek() == '#' {
+		return nil, nil
+	}
+
+	if !isIdentStart(s.peek()) {
+		return nil, s.errf(s.here(), "expected a color name or \"oklch(...)\", found %s", describeRest(s.text[s.pos:]))
+	}
+	ident, identPos := s.scanIdent()
+
+	var name, fnIdent string
+	var funcPos Pos
+	s.skipSpaces()
+	switch s.peek() {
+	case ':':
+		s.advance()
+		s.skipSpaces()
+		name = ident
+		if s.peek() == '#' {
+			return s.finishHexEntry(name)
+		}
+		if !isIdentStart(s.peek()) {
+			return nil, s.errf(s.here(), "expected a color function after %q, found %s", name+":", describeRest(s.text[s.pos:]))
+		}
+		id, pos := s.scanIdent()
+		if !isSupportedFunc(id) {
+			return nil, s.errf(pos, "unsupported color function %q (supported: \"oklch\", \"rgb\", \"hsl\")", id)
+		}
+		fnIdent, funcPos = id, pos
+	case '(':
+		if !isSupportedFunc(ident) {
+			return nil, s.errf(identPos, "unsupported color function %q (supported: \"oklch\", \"rgb\", \"hsl\")", ident)
+		}
+		fnIdent, funcPos = ident, identPos
+	default:
+		return nil, s.errf(s.here(), "expected ':' or '(' after %q, found %s", ident, describeRest(s.text[s.pos:]))
+	}
+
+	if err := s.expect('(', "'('"); err != nil {
+		return nil, err
+	}
+	s.skipSpaces()
+
+	switch fnIdent {
+	case "rgb":
+		return s.finishRGBEntry(name, funcPos, raw)
+	case "hsl":
+		return s.finishHSLEntry(name, funcPos, raw)
+	default:
+		return s.finishOKLCHEntry(name, funcPos, raw)
+	}
 }
