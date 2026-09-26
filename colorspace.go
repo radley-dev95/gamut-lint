@@ -1,6 +1,11 @@
 package main
 
-import "math"
+import (
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+)
 
 // epsilon accounts for floating point error when checking the sRGB gamut
 // boundary; without it colors that are mathematically exactly at 0 or 1
@@ -32,6 +37,75 @@ func oklabToLinearSRGB(L, a, b float64) (r, g, bl float64) {
 	g = -1.2684380046*l + 2.6097574011*m - 0.3413193965*s
 	bl = -0.0041960863*l - 0.7034186147*m + 1.7076147010*s
 	return
+}
+
+// oklabToXYZ converts OKLab to CIE XYZ (D65), by way of the LMS space OKLab
+// is built on. This is Björn Ottosson's published forward matrix (XYZ to
+// LMS) inverted; it's the general-purpose route to any RGB gamut, unlike
+// oklabToLinearSRGB above, which shortcuts straight to sRGB via a combined,
+// separately-published matrix.
+func oklabToXYZ(L, a, b float64) (x, y, z float64) {
+	l_ := L + 0.3963377774*a + 0.2158037573*b
+	m_ := L - 0.1055613458*a - 0.0638541728*b
+	s_ := L - 0.0894841775*a - 1.2914855480*b
+
+	l := l_ * l_ * l_
+	m := m_ * m_ * m_
+	s := s_ * s_ * s_
+
+	x = 1.2270138511*l - 0.5577999807*m + 0.2812561490*s
+	y = -0.0405801784*l + 1.1122568696*m - 0.0716766787*s
+	z = -0.0763812845*l - 0.4214819784*m + 1.5861632204*s
+	return
+}
+
+// oklabToLinearP3 converts OKLab to linear-light (not gamma encoded)
+// Display P3, via CIE XYZ (D65). The XYZ-to-linear-P3 matrix is the
+// standard one derived from P3's D65 primaries.
+func oklabToLinearP3(L, a, b float64) (r, g, bl float64) {
+	x, y, z := oklabToXYZ(L, a, b)
+	r = 2.4934969119*x - 0.9313836179*y - 0.4027107845*z
+	g = -0.8294889696*x + 1.7626640603*y + 0.0236246858*z
+	bl = 0.0358458302*x - 0.0761723893*y + 0.9568845240*z
+	return
+}
+
+// oklabToLinearRec2020 converts OKLab to linear-light (not gamma encoded)
+// Rec. 2020, via CIE XYZ (D65). The XYZ-to-linear-Rec2020 matrix is the
+// standard one derived from Rec. 2020's D65 primaries.
+func oklabToLinearRec2020(L, a, b float64) (r, g, bl float64) {
+	x, y, z := oklabToXYZ(L, a, b)
+	r = 1.7166511880*x - 0.3556707838*y - 0.2533662814*z
+	g = -0.6666843518*x + 1.6164812366*y + 0.0157685458*z
+	bl = 0.0176398574*x - 0.0427706133*y + 0.9421031212*z
+	return
+}
+
+// Gamut is a target RGB gamut to check OKLCH colors against.
+type Gamut struct {
+	Name     string
+	toLinear func(L, a, b float64) (r, g, bl float64)
+}
+
+// gamuts holds every target gamut gamut-lint knows how to check against,
+// keyed by the name used on the command line.
+var gamuts = map[string]Gamut{
+	"srgb":    {Name: "sRGB", toLinear: oklabToLinearSRGB},
+	"p3":      {Name: "Display P3", toLinear: oklabToLinearP3},
+	"rec2020": {Name: "Rec. 2020", toLinear: oklabToLinearRec2020},
+}
+
+// ParseGamut looks up a target gamut by its command-line name.
+func ParseGamut(name string) (Gamut, error) {
+	if g, ok := gamuts[name]; ok {
+		return g, nil
+	}
+	names := make([]string, 0, len(gamuts))
+	for n := range gamuts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return Gamut{}, fmt.Errorf("unknown gamut %q (supported: %s)", name, strings.Join(names, ", "))
 }
 
 // srgbGammaToLinear undoes sRGB gamma encoding for a single channel in
@@ -117,21 +191,21 @@ func inRange01(v float64) bool {
 	return v >= -epsilon && v <= 1+epsilon
 }
 
-func inSRGBGamut(r, g, b float64) bool {
+func inGamut(r, g, b float64) bool {
 	return inRange01(r) && inRange01(g) && inRange01(b)
 }
 
 // maxChromaInGamut finds the largest chroma <= cMax such that the OKLCH
-// color (l, chroma, hDeg) still falls inside the sRGB gamut, by binary
+// color (l, chroma, hDeg) still falls inside the target gamut, by binary
 // search over chroma. Chroma 0 (a neutral gray at the given lightness) is
 // always in gamut, so the search always has a valid lower bound.
-func maxChromaInGamut(l, hDeg, cMax float64) float64 {
+func maxChromaInGamut(g Gamut, l, hDeg, cMax float64) float64 {
 	lo, hi := 0.0, cMax
 	for i := 0; i < 40; i++ {
 		mid := (lo + hi) / 2
 		_, a, b := oklchToOklab(l, mid, hDeg)
-		r, g, bl := oklabToLinearSRGB(l, a, b)
-		if inSRGBGamut(r, g, bl) {
+		r, gr, bl := g.toLinear(l, a, b)
+		if inGamut(r, gr, bl) {
 			lo = mid
 		} else {
 			hi = mid
@@ -145,11 +219,11 @@ type gamutResult struct {
 	MaxChroma float64 // only meaningful when InGamut is false
 }
 
-func checkGamut(e *Entry) gamutResult {
+func checkGamut(e *Entry, g Gamut) gamutResult {
 	_, a, b := oklchToOklab(e.L, e.C, e.H)
-	r, g, bl := oklabToLinearSRGB(e.L, a, b)
-	if inSRGBGamut(r, g, bl) {
+	r, gr, bl := g.toLinear(e.L, a, b)
+	if inGamut(r, gr, bl) {
 		return gamutResult{InGamut: true}
 	}
-	return gamutResult{InGamut: false, MaxChroma: maxChromaInGamut(e.L, e.H, e.C)}
+	return gamutResult{InGamut: false, MaxChroma: maxChromaInGamut(g, e.L, e.H, e.C)}
 }

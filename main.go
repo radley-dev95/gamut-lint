@@ -1,19 +1,34 @@
-// gamut-lint checks a palette of OKLCH colors against the sRGB gamut and
-// reports which ones a typical monitor can't actually display.
+// gamut-lint checks a palette of OKLCH colors against a target gamut (sRGB
+// by default) and reports which ones a typical monitor can't actually
+// display.
 package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"os"
 )
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: gamut-lint <palette-file>")
+	gamutName := flag.String("gamut", "srgb", "target gamut to check against: srgb, p3, or rec2020")
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: gamut-lint [--gamut=srgb|p3|rec2020] <palette-file>")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if flag.NArg() != 1 {
+		flag.Usage()
 		os.Exit(2)
 	}
-	path := os.Args[1]
+	path := flag.Arg(0)
+
+	gamut, err := ParseGamut(*gamutName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gamut-lint: %v\n", err)
+		os.Exit(2)
+	}
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -54,7 +69,7 @@ func main() {
 		if label == "" {
 			label = "(unnamed)"
 		}
-		result := checkGamut(e)
+		result := checkGamut(e, gamut)
 		if result.InGamut {
 			fmt.Printf("%s:%d:%d: %-20s in gamut\n", path, e.Pos.Line, e.Pos.Col, label)
 			continue
@@ -64,7 +79,7 @@ func main() {
 			path, e.Pos.Line, e.Pos.Col, label, e.C, result.MaxChroma)
 	}
 
-	fmt.Printf("\n%d color(s) checked, %d out of gamut\n", len(entries), outOfGamut)
+	fmt.Printf("\n%d color(s) checked against %s, %d out of gamut\n", len(entries), gamut.Name, outOfGamut)
 	if outOfGamut > 0 {
 		os.Exit(1)
 	}
